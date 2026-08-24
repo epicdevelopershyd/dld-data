@@ -3,7 +3,7 @@ name: DLD broker mirror relay
 on:
   schedule:
     - cron: "0 2 * * *"   # 02:00 UTC = 06:00 Dubai, daily
-  workflow_dispatch:        # manual "Run workflow" button for the proof run
+  workflow_dispatch:        # manual "Run workflow" button
 
 permissions:
   contents: write
@@ -14,48 +14,97 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch brokers.csv from Dubai Pulse
+      - name: Fetch via Dubai Pulse API (preferred, needs secrets)
+        if: ${{ env.DP_KEY != '' }}
+        env:
+          DP_KEY: ${{ secrets.DP_API_KEY }}
+          DP_SECRET: ${{ secrets.DP_API_SECRET }}
         run: |
           set -e
+          echo "API lane: requesting OAuth token..."
+          TOKEN=$(curl -sS --fail --connect-timeout 20 \
+            -X POST "https://api.dubaipulse.gov.ae/oauth/client_credential/accesstoken?grant_type=client_credentials" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data "client_id=${DP_KEY}&client_secret=${DP_SECRET}" | \
+            python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+          echo "Token acquired. Fetching broker dataset..."
+          curl -sS --fail --connect-timeout 20 --max-time 600 \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://api.dubaipulse.gov.ae/open/dld/dld_brokers-open-api" -o api.raw
+          echo "First bytes of response:"; head -c 300 api.raw; echo
+          python3 <<'PY'
+          import json, csv, sys
+          raw = open("api.raw", "rb").read()
+          txt = raw.decode("utf-8-sig", errors="replace")
+          hdr = ["Broker Number","Broker Name","Gender","License Start Date","License End Date","Website","Phone","Fax","Real Estate Number","Real Estate Name"]
+          keys = ["broker_number","broker_en","gender_en","license_start_date","license_end_date","webpage","phone","fax","real_estate_number","real_estate_en"]
+          rows = None
+          if txt.lstrip().startswith("{") or txt.lstrip().startswith("["):
+              j = json.loads(txt)
+              for path in [j, j.get("result", {}).get("records") if isinstance(j, dict) else None,
+                           j.get("records") if isinstance(j, dict) else None,
+                           j.get("data") if isinstance(j, dict) else None,
+                           j.get("rows") if isinstance(j, dict) else None]:
+                  if isinstance(path, list) and path and isinstance(path[0], dict):
+                      rows = path; break
+              if rows is None:
+                  print("REFUSED: JSON shape unrecognized; top-level keys:",
+                        list(j.keys())[:10] if isinstance(j, dict) else type(j)); sys.exit(1)
+              low0 = {k.lower(): k for k in rows[0].keys()}
+              missing = [k for k in ["broker_number","broker_en"] if k not in low0]
+              if missing:
+                  print("REFUSED: fields missing:", missing, "| available:", list(low0)[:15]); sys.exit(1)
+              out = [",".join(hdr)]
+              for r in rows:
+                  low = {k.lower(): v for k, v in r.items()}
+                  cells = []
+                  for k in keys:
+                      c = str(low.get(k, "") or "").replace('"', "").replace(",", " ")
+                      cells.append(" ".join(c.split()))
+                  out.append(",".join(cells))
+              open("brokers.new.csv", "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
+              print("API JSON mapped:", len(rows), "rows")
+          elif "broker" in txt[:200].lower():
+              open("brokers.new.csv", "w", encoding="utf-8", newline="\n").write(txt)
+              print("API returned CSV directly")
+          else:
+              print("REFUSED: response is neither JSON nor broker CSV. Starts with:", txt[:200]); sys.exit(1)
+          PY
+
+      - name: Fetch direct CSV (fallback when no API secrets)
+        if: ${{ env.DP_KEY == '' }}
+        env:
+          DP_KEY: ${{ secrets.DP_API_KEY }}
+        run: |
+          set -e
+          echo "No API secrets configured — trying direct CSV lane (blocked from datacenters as of 24 Aug 2026, may fail)..."
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
           URL_MAIN="https://www.dubaipulse.gov.ae/dataset/4830ea7f-0a2b-4192-bb21-4002bcdb01ec/resource/84897e8a-1c2f-43df-8e55-bea205a8a66e/download/brokers.csv"
           URL_GSLB="https://gslb.dubaipulse.gov.ae/dataset/4830ea7f-0a2b-4192-bb21-4002bcdb01ec/resource/84897e8a-1c2f-43df-8e55-bea205a8a66e/download/brokers.csv"
-
-          fetch_one () {
-            curl -sSL --fail --connect-timeout 20 --max-time 300 \
-              -A "$UA" \
-              -H "Accept: text/csv,application/octet-stream,*/*" \
-              -H "Referer: https://www.dubaipulse.gov.ae/data/dld-registration/dld_brokers-open" \
-              "$1" -o brokers.new.csv
-          }
-
-          echo "Trying main host..."
-          if ! fetch_one "$URL_MAIN"; then
-            echo "Main host failed, trying gslb..."
-            fetch_one "$URL_GSLB"
-          fi
+          fetch_one () { curl -sSL --fail --connect-timeout 20 --max-time 300 -A "$UA" "$1" -o pulse.raw; }
+          if ! fetch_one "$URL_MAIN"; then fetch_one "$URL_GSLB"; fi
+          python3 <<'PY'
+          import csv, re
+          rows = list(csv.reader(open("pulse.raw", encoding="utf-8-sig", newline="")))
+          hdr = ["Broker Number","Broker Name","Gender","License Start Date","License End Date","Website","Phone","Fax","Real Estate Number","Real Estate Name"]
+          out = [",".join(hdr)]
+          for r in rows[1:]:
+              cells = [" ".join(c.strip().replace('"',"").replace(","," ").split()) for c in r]
+              out.append(",".join(cells))
+          open("brokers.new.csv","w",encoding="utf-8",newline="\n").write("\n".join(out)+"\n")
+          print("Direct CSV reshaped:", len(out)-1, "rows")
+          PY
 
       - name: Validate before commit
         run: |
           set -e
           test -s brokers.new.csv
-
           HEAD_LINE=$(head -n 1 brokers.new.csv | tr '[:upper:]' '[:lower:]')
           echo "Header: $HEAD_LINE"
-          case "$HEAD_LINE" in
-            *broker*) ;;
-            *) echo "REFUSED: header does not contain 'broker' — likely an error page, not data."; exit 1 ;;
-          esac
-          if head -c 500 brokers.new.csv | grep -qi "<html"; then
-            echo "REFUSED: HTML detected — WAF page, not CSV."; exit 1
-          fi
-
+          case "$HEAD_LINE" in *"broker number"*) ;; *) echo "REFUSED: header mismatch"; exit 1;; esac
           ROWS=$(wc -l < brokers.new.csv)
           echo "Rows: $ROWS"
-          if [ "$ROWS" -lt 1000 ]; then
-            echo "REFUSED: only $ROWS rows — refusing to overwrite mirror source with a stub."; exit 1
-          fi
-
+          [ "$ROWS" -ge 1000 ] || { echo "REFUSED: only $ROWS rows"; exit 1; }
           mv brokers.new.csv brokers.csv
 
       - name: Commit only if changed
@@ -63,9 +112,7 @@ jobs:
           git config user.name "dld-relay-bot"
           git config user.email "actions@github.com"
           git add brokers.csv
-          if git diff --cached --quiet; then
-            echo "No change in DLD data today — nothing committed."
-          else
+          if git diff --cached --quiet; then echo "No change today."; else
             ROWS=$(wc -l < brokers.csv)
             git commit -m "DLD brokers refresh: $ROWS rows ($(date -u +%Y-%m-%d))"
             git push
