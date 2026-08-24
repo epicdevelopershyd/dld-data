@@ -1,0 +1,72 @@
+name: DLD broker mirror relay
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC = 06:00 Dubai, daily
+  workflow_dispatch:        # manual "Run workflow" button for the proof run
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch brokers.csv from Dubai Pulse
+        run: |
+          set -e
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          URL_MAIN="https://www.dubaipulse.gov.ae/dataset/4830ea7f-0a2b-4192-bb21-4002bcdb01ec/resource/84897e8a-1c2f-43df-8e55-bea205a8a66e/download/brokers.csv"
+          URL_GSLB="https://gslb.dubaipulse.gov.ae/dataset/4830ea7f-0a2b-4192-bb21-4002bcdb01ec/resource/84897e8a-1c2f-43df-8e55-bea205a8a66e/download/brokers.csv"
+
+          fetch_one () {
+            curl -sSL --fail --connect-timeout 20 --max-time 300 \
+              -A "$UA" \
+              -H "Accept: text/csv,application/octet-stream,*/*" \
+              -H "Referer: https://www.dubaipulse.gov.ae/data/dld-registration/dld_brokers-open" \
+              "$1" -o brokers.new.csv
+          }
+
+          echo "Trying main host..."
+          if ! fetch_one "$URL_MAIN"; then
+            echo "Main host failed, trying gslb..."
+            fetch_one "$URL_GSLB"
+          fi
+
+      - name: Validate before commit
+        run: |
+          set -e
+          test -s brokers.new.csv
+
+          HEAD_LINE=$(head -n 1 brokers.new.csv | tr '[:upper:]' '[:lower:]')
+          echo "Header: $HEAD_LINE"
+          case "$HEAD_LINE" in
+            *broker*) ;;
+            *) echo "REFUSED: header does not contain 'broker' — likely an error page, not data."; exit 1 ;;
+          esac
+          if head -c 500 brokers.new.csv | grep -qi "<html"; then
+            echo "REFUSED: HTML detected — WAF page, not CSV."; exit 1
+          fi
+
+          ROWS=$(wc -l < brokers.new.csv)
+          echo "Rows: $ROWS"
+          if [ "$ROWS" -lt 1000 ]; then
+            echo "REFUSED: only $ROWS rows — refusing to overwrite mirror source with a stub."; exit 1
+          fi
+
+          mv brokers.new.csv brokers.csv
+
+      - name: Commit only if changed
+        run: |
+          git config user.name "dld-relay-bot"
+          git config user.email "actions@github.com"
+          git add brokers.csv
+          if git diff --cached --quiet; then
+            echo "No change in DLD data today — nothing committed."
+          else
+            ROWS=$(wc -l < brokers.csv)
+            git commit -m "DLD brokers refresh: $ROWS rows ($(date -u +%Y-%m-%d))"
+            git push
+          fi
