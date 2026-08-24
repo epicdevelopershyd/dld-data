@@ -23,16 +23,21 @@ jobs:
           set -e
           echo "API lane: requesting OAuth token..."
           BASIC=$(printf '%s:%s' "$DP_KEY" "$DP_SECRET" | base64 -w0)
-          TOKEN=$(curl -sS --fail --connect-timeout 20 \
-            -X POST "https://api.dubaipulse.gov.ae/oauth/client_credential/accesstoken?grant_type=client_credentials" \
+          TOKEN=""
+          for AUTH_HOST in apis.data.dubai api.dubaipulse.gov.ae; do
+            TOKEN=$(curl -sS --fail --connect-timeout 20 \
+              -X POST "https://${AUTH_HOST}/oauth/client_credential/accesstoken?grant_type=client_credentials" \
             -H "Authorization: Basic ${BASIC}" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            --data "client_id=${DP_KEY}&client_secret=${DP_SECRET}" | \
-            python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+              --data "client_id=${DP_KEY}&client_secret=${DP_SECRET}" | \
+              python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])" ) && break || echo "token failed on ${AUTH_HOST}"
+          done
+          [ -n "$TOKEN" ] || { echo "no token from any host"; exit 1; }
+          DATA_HOST=$AUTH_HOST
           echo "Token acquired. Fetching broker dataset..."
           curl -sS --fail --connect-timeout 20 --max-time 600 \
             -H "Authorization: Bearer ${TOKEN}" \
-            "https://api.dubaipulse.gov.ae/open/dld/dld_brokers-open-api" -o api.raw
+            "https://${DATA_HOST}/open/dld/dld_brokers-open-api" -o api.raw
           echo "First bytes of response:"; head -c 300 api.raw; echo
           python3 <<'PY'
           import json, csv, sys
