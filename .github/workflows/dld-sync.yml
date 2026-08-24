@@ -22,8 +22,10 @@ jobs:
         run: |
           set -e
           echo "API lane: requesting OAuth token..."
+          BASIC=$(printf '%s:%s' "$DP_KEY" "$DP_SECRET" | base64 -w0)
           TOKEN=$(curl -sS --fail --connect-timeout 20 \
             -X POST "https://api.dubaipulse.gov.ae/oauth/client_credential/accesstoken?grant_type=client_credentials" \
+            -H "Authorization: Basic ${BASIC}" \
             -H "Content-Type: application/x-www-form-urlencoded" \
             --data "client_id=${DP_KEY}&client_secret=${DP_SECRET}" | \
             python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
